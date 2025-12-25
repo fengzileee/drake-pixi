@@ -1,73 +1,14 @@
 [workspace]
-name = "drake-workspace"
-version = "0.1.0"
-description = "Environment for building Drake from source on Linux and macOS"
 channels = ["https://prefix.dev/conda-forge"]
 platforms = ["linux-64", "osx-arm64"]
-
-[tasks]
-install-drake = { cmd = "./install_drake.sh", depends-on = ["_ensure-executable"] }
-_ensure-executable = "chmod +x install_drake.sh"
-
-[target.osx-arm64.activation]
-scripts = ["scripts/check_xcode.sh", "scripts/setup_xcode_env.sh"]
+preview = ["pixi-build"]
 
 [dependencies]
-# Build Core
-cmake = ">=3.25"
-ninja = "*"
-make = "*"
-pkgconfig = "*"       # Vital: Helps Drake find the libs below
-patch = "*"
-git = "*"
-zip = "*"
-unzip = "*"
+drake = { path = "." }
 
-# Bazel Stack
-bazel = ">=8"
-openjdk = "21.*"
+[package]
+name = "drake"
+version = "1.45.0"
 
-# Python dependencies
-numpy = "*"
-ipython = "*"
-pip = "*"
-pyyaml = ">=6.0.3,<7"
-notebook = ">=7.5.1,<8"
-
-# Libraries
-eigen = "*"
-glib = "*"
-fmt = "*"
-spdlog = "*"
-
-# --- Linux Specifics (The Heavy Lifting) ---
-[target.linux-64.dependencies]
-python = "3.12.*"
-
-compilers = "*"
-sysroot_linux-64 = "2.17.*"
-patchelf = "*"
-libuuid = "*"
-
-# Libraries usually provided by apt (mapped to conda-forge)
-zlib = "*"             # Compression
-libblas = "*"          # Basic Linear Algebra Subprograms
-libcblas = "*"         # C Interface to BLAS
-liblapack = "*"        # Linear Algebra PACKage
-
-# X11 Libraries (These names are correct)
-xorg-libx11 = "*"
-xorg-libxt = "*"
-xorg-libxext = "*"
-xorg-libxi = "*"
-xorg-libxrender = "*"
-xorg-libxrandr = "*"  # Added: Drake often needs XRandR too
-
-# OpenGL FIX: Use 'libgl' and 'libglu' instead of 'mesa-libgl-devel'
-libgl = "*"    # Includes GL/gl.h
-libglu = "*"   # Includes GL/glu.h
-
-# --- macOS Specifics ---
-[target.osx-arm64.dependencies]
-# On OSX drake use bazel's apple_support that uses xcode toolchain
-python = "3.13.*"
+[package.build]
+backend = { name = "pixi-build-rattler-build", version = "0.3.*" }

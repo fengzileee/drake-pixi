@@ -1,0 +1,136 @@
+context:
+  name: drake
+  version: 1.45.0
+  git_url: https://github.com/RobotLocomotion/drake.git
+
+package:
+  name: ${{ name }}
+  version: ${{ version }}
+
+source:
+  git: ${{ git_url }}
+  tag: v${{ version }}
+
+build:
+  number: 0
+  script: |
+    set -ex
+
+    # --- 1. macOS Checks ---
+    if [ "$(uname)" = "Darwin" ]; then
+      # Robust Check: ensure Xcode exists and is not just CLI tools
+      XCODE_PATH=$(xcode-select -p 2>/dev/null || echo "")
+      if [ -z "$XCODE_PATH" ] || echo "$XCODE_PATH" | grep -q "CommandLineTools"; then
+         echo "❌ Error: Full Xcode not found. 'xcode-select -p' returned: $XCODE_PATH"
+         exit 1
+      fi
+      
+      echo "build --action_env=DEVELOPER_DIR=$XCODE_PATH" >> user.bazelrc
+      echo "build --action_env=XCODE_VERSION_OVERRIDE=$(xcodebuild -version | grep Xcode | awk '{print $2}')" >> user.bazelrc
+      export BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=1
+    fi
+
+    # --- 2. CONFIG: Compatibility & Safety ---
+    # Enable "Loud" logs (prevents silent stalls)
+    echo "build --curses=no" >> user.bazelrc
+    echo "build --color=yes" >> user.bazelrc
+    echo "build --show_progress_rate_limit=15" >> user.bazelrc
+
+    # --- 3. Bazel Version Patch ---
+    BAZEL_BIN=$(which bazel)
+    INSTALLED_VER=$($BAZEL_BIN --version | awk '{print $2}')
+    echo "$INSTALLED_VER" > .bazelversion
+
+    # --- 4. PATCHING 'repository.bzl' ---
+    TARGET_BZL="tools/workspace/python/repository.bzl"
+    echo " -> Patching $TARGET_BZL..."
+
+    # PATCH A: Fix "File Name Too Long" (Hash the path)
+    sed -i.bak 's|cflag\[2:\].replace("/", "_")|str(hash(cflag[2:]))|' "$TARGET_BZL"
+
+    # PATCH B: Disable Venv Creation on macOS (Use Pixi env)
+    sed -i.bak2 's|if os_name != "mac os x" and not is_wheel_build:|if True:|' "$TARGET_BZL"
+
+    # --- 5. Python Helper ---
+    ln -sf "$PREFIX/bin/python3-config" "$PREFIX/bin/python-config"
+
+    # --- 6. CLEANUP & BUILD ---
+    mkdir -p build_install
+    cd build_install
+
+    cmake .. \
+      -DCMAKE_INSTALL_PREFIX=$PREFIX \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DWITH_MOSEK=OFF \
+      -DWITH_SNOPT=OFF \
+      -DPython_EXECUTABLE=$PREFIX/bin/python \
+      -G Ninja
+
+    ninja install
+
+    # --- 6. Cleanup ---
+    rm "$PREFIX/bin/python-config"
+
+requirements:
+  build:
+    - cmake >=3.25
+    - ninja
+    - pkgconfig
+    - patch
+    - git
+    - bazel >=8
+    - openjdk =21
+    # - zip
+    # - unzip
+    - python >=3.12,<3.14
+    - pyyaml >=6.0.3,<7
+    - matplotlib
+    
+    # LINUX: Use hermetic compilers
+    - if: linux
+      then:
+        - ${{ compiler('cxx') }}
+        - ${{ compiler('c') }}
+    
+    # macOS: NO COMPILER LISTED (Forces system Xcode usage)
+
+  host:
+    - python >=3.12,<3.14
+    - pip
+    - numpy
+    - pyyaml >=6.0.3,<7
+    - matplotlib
+    - eigen
+    - fmt
+    - spdlog
+    - glib
+    
+    # LINUX: System Libraries
+    - if: linux
+      then:
+        - sysroot_linux-64 =2.17
+        - patchelf
+        - libuuid
+        - zlib
+        - libblas
+        - libcblas
+        - liblapack
+        - xorg-libx11
+        - xorg-libxt
+        - xorg-libxext
+        - xorg-libxi
+        - xorg-libxrender
+        - xorg-libxrandr
+        - libgl-devel
+        - libglu
+
+  run:
+    - python >=3.12,<3.14
+    - numpy
+    - pyyaml >=6.0.3,<7
+    - matplotlib
+    - notebook >=7.5.1,<8
+
+tests:
+  - script:
+      - python -c "import pydrake; print('Drake imported successfully')"
