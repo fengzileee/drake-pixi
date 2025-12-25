@@ -3,35 +3,71 @@ name = "drake-workspace"
 version = "0.1.0"
 description = "Environment for building Drake from source on Linux and macOS"
 channels = ["https://prefix.dev/conda-forge"]
-# Explicitly list both targets you support
 platforms = ["linux-64", "osx-arm64"]
 
 [tasks]
 install-drake = { cmd = "./install_drake.sh", depends-on = ["_ensure-executable"] }
 _ensure-executable = "chmod +x install_drake.sh"
 
-# --- Common Dependencies (Both OS) ---
+[target.osx-arm64.activation]
+scripts = ["scripts/check_xcode.sh", "scripts/setup_xcode_env.sh"]
+
 [dependencies]
-cmake = ">=3.24"
+# Build Core
+cmake = ">=3.25"
 ninja = "*"
-bazel = ">=7"
-python = "3.12.*"  # Pinned for stability
+make = "*"
+pkgconfig = "*"       # Vital: Helps Drake find the libs below
+patch = "*"
+git = "*"
+zip = "*"
+unzip = "*"
+
+# Bazel Stack
+bazel = ">=8"
+openjdk = "21.*"
+
+# Python dependencies
 numpy = "*"
-pkgconfig = "*"   # Essential for finding libs
+ipython = "*"
+pip = "*"
+pyyaml = ">=6.0.3,<7"
+notebook = ">=7.5.1,<8"
+
+# Libraries
 eigen = "*"
+glib = "*"
+fmt = "*"
+spdlog = "*"
 
-# --- Linux Specifics ---
+# --- Linux Specifics (The Heavy Lifting) ---
 [target.linux-64.dependencies]
-# Includes gcc and g++
-compilers = "*"
-# Helps CMake find system headers (glibc, kernel headers) cleanly
-sysroot_linux-64 = "2.17.*" 
-# Utilities often needed by Drake on Linux
-patchelf = "*"
+python = "3.12.*"
 
-# --- macOS (Apple Silicon) Specifics ---
-[target.osx-arm64.dependencies]
-# Includes clang and clang++
 compilers = "*"
-# OpenMP support is separate on Clang/macOS
-llvm-openmp = "*"
+sysroot_linux-64 = "2.17.*"
+patchelf = "*"
+libuuid = "*"
+
+# Libraries usually provided by apt (mapped to conda-forge)
+zlib = "*"             # Compression
+libblas = "*"          # Basic Linear Algebra Subprograms
+libcblas = "*"         # C Interface to BLAS
+liblapack = "*"        # Linear Algebra PACKage
+
+# X11 Libraries (These names are correct)
+xorg-libx11 = "*"
+xorg-libxt = "*"
+xorg-libxext = "*"
+xorg-libxi = "*"
+xorg-libxrender = "*"
+xorg-libxrandr = "*"  # Added: Drake often needs XRandR too
+
+# OpenGL FIX: Use 'libgl' and 'libglu' instead of 'mesa-libgl-devel'
+libgl = "*"    # Includes GL/gl.h
+libglu = "*"   # Includes GL/glu.h
+
+# --- macOS Specifics ---
+[target.osx-arm64.dependencies]
+# On OSX drake use bazel's apple_support that uses xcode toolchain
+python = "3.13.*"
