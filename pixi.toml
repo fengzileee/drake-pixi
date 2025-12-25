@@ -1,0 +1,37 @@
+[workspace]
+name = "drake-workspace"
+version = "0.1.0"
+description = "Environment for building Drake from source on Linux and macOS"
+channels = ["https://prefix.dev/conda-forge"]
+# Explicitly list both targets you support
+platforms = ["linux-64", "osx-arm64"]
+
+[tasks]
+install-drake = { cmd = "./install_drake.sh", depends-on = ["_ensure-executable"] }
+_ensure-executable = "chmod +x install_drake.sh"
+
+# --- Common Dependencies (Both OS) ---
+[dependencies]
+cmake = ">=3.24"
+ninja = "*"
+bazel = ">=7"
+python = "3.12.*"  # Pinned for stability
+numpy = "*"
+pkgconfig = "*"   # Essential for finding libs
+eigen = "*"
+
+# --- Linux Specifics ---
+[target.linux-64.dependencies]
+# Includes gcc and g++
+compilers = "*"
+# Helps CMake find system headers (glibc, kernel headers) cleanly
+sysroot_linux-64 = "2.17.*" 
+# Utilities often needed by Drake on Linux
+patchelf = "*"
+
+# --- macOS (Apple Silicon) Specifics ---
+[target.osx-arm64.dependencies]
+# Includes clang and clang++
+compilers = "*"
+# OpenMP support is separate on Clang/macOS
+llvm-openmp = "*"
