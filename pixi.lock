@@ -1042,9 +1042,9 @@ packages:
   - matplotlib
   - notebook >=7.5.1,<8
   - __glibc >=2.17,<3.0.a0
-  - libstdcxx >=15
-  - libgcc >=15
-  - libgcc >=15
+  - libstdcxx >=12
+  - libgcc >=12
+  - libgcc >=12
   - python_abi 3.13.* *_cp313
   - fmt >=12.0.0,<12.1.0a0
   - spdlog >=1.16.0,<1.17.0a0
