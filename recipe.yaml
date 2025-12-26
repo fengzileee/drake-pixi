@@ -13,63 +13,230 @@ source:
 
 build:
   number: 0
-  script: |
-    set -ex
-
-    # --- 1. macOS Checks ---
-    if [ "$(uname)" = "Darwin" ]; then
-      # Robust Check: ensure Xcode exists and is not just CLI tools
-      XCODE_PATH=$(xcode-select -p 2>/dev/null || echo "")
-      if [ -z "$XCODE_PATH" ] || echo "$XCODE_PATH" | grep -q "CommandLineTools"; then
-         echo "❌ Error: Full Xcode not found. 'xcode-select -p' returned: $XCODE_PATH"
-         exit 1
+  script:
+    - | # --- macOS: ensure Xcode exists and is not just CLI tools ---
+      if [ "$(uname)" = "Darwin" ]; then
+        XCODE_PATH=$(xcode-select -p 2>/dev/null || echo "")
+        if [ -z "$XCODE_PATH" ] || echo "$XCODE_PATH" | grep -q "CommandLineTools"; then
+          echo "Error: Full Xcode not found. 'xcode-select -p' returned: $XCODE_PATH"
+          exit 1
+        fi
       fi
-      
-      echo "build --action_env=DEVELOPER_DIR=$XCODE_PATH" >> user.bazelrc
-      echo "build --action_env=XCODE_VERSION_OVERRIDE=$(xcodebuild -version | grep Xcode | awk '{print $2}')" >> user.bazelrc
-      export BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=1
-    fi
+    - | # --- Linux: Point toolchain to Pixi ---
+      if [ "$(uname)" = "Linux" ]; then
+        # 1. CREATE WRAPPER DIR
+        WRAPPER_DIR="$(pwd)/pixi-wrappers"
+        mkdir -p "$WRAPPER_DIR"
 
-    # --- 2. CONFIG: Compatibility & Safety ---
-    # Enable "Loud" logs (prevents silent stalls)
-    echo "build --curses=no" >> user.bazelrc
-    echo "build --color=yes" >> user.bazelrc
-    echo "build --show_progress_rate_limit=15" >> user.bazelrc
+        # 2. CAPTURE THE REAL LINKER PATH
+        REAL_BFD="${BUILD_PREFIX}/bin/x86_64-conda-linux-gnu-ld.bfd"
 
-    # --- 3. Bazel Version Patch ---
-    BAZEL_BIN=$(which bazel)
-    INSTALLED_VER=$($BAZEL_BIN --version | awk '{print $2}')
-    echo "$INSTALLED_VER" > .bazelversion
+        # 3. CREATE THE SHIM SCRIPT
+        cat <<EOF > "$WRAPPER_DIR/link-wrapper"
+      #!/bin/bash
+      args=()
+      for arg in "\$@"; do
+          # Strip the flags that BFD doesn't understand
+          if [[ "\$arg" != "--start-lib" && "\$arg" != "--end-lib" ]]; then
+              args+=("\$arg")
+          fi
+      done
+      # Ensure we call the absolute path of the real linker to avoid infinite loops
+      exec $REAL_BFD "\${args[@]}"
+      EOF
+        chmod +x "$WRAPPER_DIR/link-wrapper"
 
-    # --- 4. PATCHING 'repository.bzl' ---
-    TARGET_BZL="tools/workspace/python/repository.bzl"
-    echo " -> Patching $TARGET_BZL..."
+        # 4. SYMLINK EVERY POSSIBLE NAME
+        # This ensures GCC finds our shim first for any -fuse-ld choice
+        ln -sf "$WRAPPER_DIR/link-wrapper" "$WRAPPER_DIR/ld"
+        ln -sf "$WRAPPER_DIR/link-wrapper" "$WRAPPER_DIR/ld.bfd"
+        ln -sf "$WRAPPER_DIR/link-wrapper" "$WRAPPER_DIR/ld.gold"
+        ln -sf "$WRAPPER_DIR/link-wrapper" "$WRAPPER_DIR/x86_64-conda-linux-gnu-ld"
+        ln -sf "$WRAPPER_DIR/link-wrapper" "$WRAPPER_DIR/x86_64-conda-linux-gnu-ld.bfd"
 
-    # PATCH A: Fix "File Name Too Long" (Hash the path)
-    sed -i.bak 's|cflag\[2:\].replace("/", "_")|str(hash(cflag[2:]))|' "$TARGET_BZL"
+        # 5. CONFIGURE BAZELRC
+        # --- Linker Shim Configuration ---
+        # Ensures our wrapper intercepts the linker to strip --start-lib
+        echo "common --linkopt=-B$WRAPPER_DIR" >> user.bazelrc
+        echo "common --host_linkopt=-B$WRAPPER_DIR" >> user.bazelrc
+        echo "common --linkopt=-fuse-ld=bfd" >> user.bazelrc
+        echo "common --host_linkopt=-fuse-ld=bfd" >> user.bazelrc
 
-    # PATCH B: Disable Venv Creation on macOS (Use Pixi env)
-    sed -i.bak2 's|if os_name != "mac os x" and not is_wheel_build:|if True:|' "$TARGET_BZL"
+        # --- The Library Bridge (The Fix for libiconv & System Hijack) ---
+        # We use 'common' so these paths apply to EVERYTHING Bazel builds
+        # -L: Finds the Pixi libraries during the build
+        # -Wl,-rpath: Bakes the Pixi path into the binaries so they don't look in /usr/lib
+        # -liconv: Explicitly resolves the symbols Conda headers expect
+        # --no-as-needed: Prevents the linker from dropping iconv due to symbol renaming
+        echo "common --linkopt=-L$PREFIX/lib" >> user.bazelrc
+        echo "common --linkopt=-Wl,-rpath,$PREFIX/lib" >> user.bazelrc
+        echo "common --linkopt=-liconv" >> user.bazelrc
+        echo "common --linkopt=-Wl,--no-as-needed" >> user.bazelrc
 
-    # --- 5. Python Helper ---
-    ln -sf "$PREFIX/bin/python3-config" "$PREFIX/bin/python-config"
+        # Duplicate for host tools to be absolutely certain stubgen succeeds
+        echo "common --host_linkopt=-L$PREFIX/lib" >> user.bazelrc
+        echo "common --host_linkopt=-Wl,-rpath,$PREFIX/lib" >> user.bazelrc
+        echo "common --host_linkopt=-liconv" >> user.bazelrc
 
-    # --- 6. CLEANUP & BUILD ---
-    mkdir -p build_install
-    cd build_install
+        # --- Drake Specific Strategy & Cleanup ---
+        echo "build --strategy=GenerateMypyStubs=standalone" >> user.bazelrc
+        echo "build --nostart_end_lib" >> user.bazelrc
+        echo "build --cxxopt=-Wno-array-bounds" >> user.bazelrc
 
-    cmake .. \
-      -DCMAKE_INSTALL_PREFIX=$PREFIX \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DWITH_MOSEK=OFF \
-      -DWITH_SNOPT=OFF \
-      -DPython_EXECUTABLE=$PREFIX/bin/python \
-      -G Ninja
+        # --- BAZEL RPATH PADDING (The "Short-to-Long" Fix) ---
+        # PROBLEM: While Pixi provides a "Long Prefix" ($PREFIX) to ensure relocation
+        # space, Bazel's internal 'simplify_rpath' feature often strips this long
+        # path, leaving a very short RPATH (e.g., '$ORIGIN') in the final binary.
+        #
+        # When Pixi's packaging step later tries to inject its own relocation paths,
+        # it finds the RPATH "slot" is now too small for the new value, causing
+        # 'patchelf' to fail with "new value is longer than old value."
 
-    ninja install
+        # A. Disable Bazel's RPATH Simplification:
+        # We stop Bazel from "cleaning up" or shortening the RPATH strings.
+        echo "build --features=-replace_full_rpath" >> user.bazelrc
+        echo "build --features=-simplify_rpath" >> user.bazelrc
 
-    # --- 6. Cleanup ---
-    rm "$PREFIX/bin/python-config"
+        # B. Manual RPATH Padding:
+        # We explicitly re-inject a massive dummy RPATH. This forces the linker to
+        # reserve a large physical "slot" in the ELF header's string table.
+        # This "cushion" ensures that no matter what path Pixi needs to write during
+        # the final relocation, there is always enough pre-allocated space.
+        LONG_PAD="/tmp/$(printf 'x%.0s' {1..400})_rpath_padding_to_fix_relocation"
+
+        echo "common --linkopt=-Wl,-rpath,$PREFIX/lib:$LONG_PAD" >> user.bazelrc
+        echo "common --host_linkopt=-Wl,-rpath,$PREFIX/lib:$LONG_PAD" >> user.bazelrc
+
+        # 6. ENVIRONMENT & PATH INJECTION
+        # We inject our wrapper directory at the very front of the PATH
+        echo "common --action_env=PATH=$WRAPPER_DIR:$BUILD_PREFIX/bin:/usr/bin:/bin" >> user.bazelrc
+        echo "common --repo_env=PATH=$WRAPPER_DIR:$BUILD_PREFIX/bin:/usr/bin:/bin" >> user.bazelrc
+        echo "build --incompatible_strict_action_env=false" >> user.bazelrc
+
+        # 7. INCLUDE PATHS
+        echo "common --repo_env=C_INCLUDE_PATH=$PREFIX/include" >> user.bazelrc
+        echo "common --repo_env=CPLUS_INCLUDE_PATH=$PREFIX/include" >> user.bazelrc
+        echo "build --action_env=C_INCLUDE_PATH=$PREFIX/include" >> user.bazelrc
+        echo "build --action_env=CPLUS_INCLUDE_PATH=$PREFIX/include" >> user.bazelrc
+
+        # 8. FIX MKDOC (Search Path Isolation)
+        # Point directly to the Pixi/Conda layout
+        # NOTE: Probably not necessary since drake 1.46.0
+        # https://github.com/RobotLocomotion/drake/pull/23431/
+        PIXI_LIBCLANG="$BUILD_PREFIX/lib/libclang.so.13"
+        CLANG_RES_DIR="$BUILD_PREFIX/lib/clang/21/include"
+
+        # Hardcoded Pixi GCC paths (using glob to catch the exact version number)
+        GCC_BASE="$BUILD_PREFIX/lib/gcc/x86_64-conda-linux-gnu"
+        # This points to the root where <optional> and <vector> live
+        CONDA_CXX_DIR=$(ls -d $GCC_BASE/*/include/c++ | head -n 1)
+        # This points to the arch-specific root where <bits/c++config.h> lives
+        CONDA_CXX_TARGET_DIR="$CONDA_CXX_DIR/x86_64-conda-linux-gnu"
+
+        # Verification: If Pixi changes the layout, fail fast with a loud message
+        if [ ! -f "$CONDA_CXX_DIR/optional" ]; then
+          echo "FATAL: Could not find <optional> in $CONDA_CXX_DIR"
+          echo "Current GCC_BASE content:"
+          ls -R "$GCC_BASE"
+          exit 1
+        fi
+
+        # Symlink clang++ so Drake finds it
+        ln -sf "$BUILD_PREFIX/bin/clang++-21" "$BUILD_PREFIX/bin/clang++"
+
+        SETUP_PY="tools/workspace/mkdoc_internal/libclang_setup.py"
+        MKDOC_PY="tools/workspace/mkdoc_internal/mkdoc.py"
+
+        # Hijack libclang_setup.py using environment variables
+        export PIXI_LIBCLANG CONDA_CXX_DIR CONDA_CXX_TARGET_DIR CLANG_RES_DIR PREFIX
+        python3 - <<EOF
+      import os
+      path = "$SETUP_PY"
+      with open(path, 'r') as f:
+          lines = f.readlines()
+
+      new_lines = []
+      skip = False
+      for line in lines:
+          if "def add_library_paths(parameters=None):" in line:
+              new_lines.append(line)
+              new_lines.append(f"    library_file = '{os.environ['PIXI_LIBCLANG']}'\n")
+              new_lines.append("    if parameters is not None:\n")
+              new_lines.append("        parameters.extend([\n")
+              new_lines.append("            '-nostdinc++',\n")
+              new_lines.append(f"            '-isystem', '{os.environ['CONDA_CXX_DIR']}',\n")
+              new_lines.append(f"            '-isystem', '{os.environ['CONDA_CXX_TARGET_DIR']}',\n")
+              new_lines.append(f"            '-isystem', '{os.environ['CLANG_RES_DIR']}',\n")
+              new_lines.append(f"            '-I{os.environ['PREFIX']}/include'\n")
+              new_lines.append("        ])\n")
+              new_lines.append("    from clang import cindex\n")
+              new_lines.append("    cindex.Config.set_library_file(library_file)\n")
+              new_lines.append("    return\n")
+              skip = True
+          if skip and "cindex.Config.set_library_file(library_file)" in line:
+              skip = False
+              continue
+          if not skip:
+              new_lines.append(line)
+
+      with open(path, 'w') as f:
+          f.writelines(new_lines)
+      EOF
+
+        # Force C++20 standard in mkdoc.py
+        sed -i 's/std = '\''-std=c++11'\''/std = '\''-std=c++20'\''/' "$MKDOC_PY"
+
+        # 9. CONFIGURE BAZEL ENVIRONMENT BRIDGE
+        # This ensures the sandbox can see Pixi's Python modules and shared libs
+        PYTHON_SITE=$($PYTHON -c "import site; print(site.getsitepackages()[0])")
+        echo "build --action_env=PYTHONPATH=$PYTHON_SITE" >> user.bazelrc
+        echo "build --action_env=LD_LIBRARY_PATH=$BUILD_PREFIX/lib" >> user.bazelrc
+
+        # We also need to pass the include path for the rest of the build
+        echo "build --action_env=CPLUS_INCLUDE_PATH=$PREFIX/include" >> user.bazelrc
+      fi
+    - | # --- HACK: Bazel Version Patch ---
+      # drake's require bazel version might not be available on conda
+      BAZEL_BIN=$(which bazel)
+      INSTALLED_VER=$($BAZEL_BIN --version | awk '{print $2}')
+      echo "$INSTALLED_VER" > .bazelversion
+    - | # --- Optional: Add resource limit ---
+      # HACK: currently hardcoded
+      echo "build --jobs=4" >> user.bazelrc  # number of jobs
+      echo "build --local_resources=ram=HOST_RAM*.5" >> user.bazelrc  # host memory
+    - | # --- HACK: PATCHING 'repository.bzl' ---
+      TARGET_BZL="tools/workspace/python/repository.bzl"
+      echo " -> Patching $TARGET_BZL..."
+    - | # PATCH A: Fix "File Name Too Long" (Hash the path)
+      sed -i.bak 's|cflag\[2:\].replace("/", "_")|str(hash(cflag[2:]))|' "$TARGET_BZL"
+
+      # PATCH B: Disable Venv Creation on macOS (Use Pixi env)
+      sed -i.bak2 's|if os_name != "mac os x" and not is_wheel_build:|if True:|' "$TARGET_BZL"
+    - | # --- HACK: Python Helper ---
+      # conda uses different names
+      ln -sf "$PREFIX/bin/python3-config" "$PREFIX/bin/python-config"
+    - | # --- Build & Install ---
+      mkdir -p build_install
+      cd build_install
+
+      export CC_FULL_PATH=$(which $CC)
+      export CXX_FULL_PATH=$(which $CXX)
+
+      cmake .. \
+        -DCMAKE_INSTALL_PREFIX=$PREFIX \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER=$CC_FULL_PATH \
+        -DCMAKE_CXX_COMPILER=$CXX_FULL_PATH \
+        -DWITH_MOSEK=OFF \
+        -DWITH_SNOPT=OFF \
+        -DPython_EXECUTABLE=$PREFIX/bin/python \
+        -DWITH_USER_EIGEN=ON \
+        -DWITH_USER_FMT=ON \
+        -DWITH_USER_SPDLOG=ON \
+        -G Ninja
+
+      ninja install
+
 
 requirements:
   build:
@@ -78,21 +245,23 @@ requirements:
     - pkgconfig
     - patch
     - git
-    - bazel >=8
+    - bazel >=8,<9
     - openjdk =21
-    # - zip
-    # - unzip
     - python >=3.12,<3.14
     - pyyaml >=6.0.3,<7
     - matplotlib
-    
-    # LINUX: Use hermetic compilers
+    - if: osx
+      then:
+        - ${{ compiler('cxx') }} >=17
+        - ${{ compiler('c') }} >=17
     - if: linux
       then:
-        - ${{ compiler('cxx') }}
-        - ${{ compiler('c') }}
-    
-    # macOS: NO COMPILER LISTED (Forces system Xcode usage)
+        - ${{ compiler('cxx') }} =12
+        - ${{ compiler('c') }} =12
+        - binutils
+        - clang =21
+        - libclang
+        - patchelf
 
   host:
     - python >=3.12,<3.14
@@ -123,6 +292,7 @@ requirements:
         - xorg-libxrandr
         - libgl-devel
         - libglu
+        - libiconv
 
   run:
     - python >=3.12,<3.14
